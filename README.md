@@ -1,10 +1,19 @@
 # Analyst Inbox
 
-Students in HIFN1009 chat with **Dana Morgan**, a pretend Manager of Decision Support at a fictional Ontario hospital network. Dana sends analysis requests about a 300-row emergency department dataset, checks students' numbers against the data, gives hints instead of answers, and asks follow-up questions.
+Students in HIFN1009 chat with **Dana Morgan**, a pretend Manager of Decision Support at a fictional Ontario hospital network. Dana sends analysis requests about fictional emergency department and supply data, checks students' numbers against the data, gives hints instead of answers, and asks follow-up questions.
 
-Dana sends the data as an Excel attachment (the full dataset with her first request, focused extracts later). Students can attach their own Excel workbook, and Dana reviews their formulas and results cell by cell, or a chart screenshot.
+Dana sends the data as an Excel attachment (the week's dataset with her first request, focused extracts later). Students can attach their own Excel workbook, and Dana reviews their formulas and results cell by cell, or a chart screenshot.
 
-Module focus options: descriptive statistics, PivotTables, charts, and presenting results.
+Module options (students pick one in the sidebar):
+
+| Module | Skills | Dataset(s) |
+| --- | --- | --- |
+| Weeks 2–3 · Arithmetic and frequency tables | + − × ÷, percentages, number formats, relative/absolute references; frequency, relative, cumulative and grouped frequency tables built without COUNTIF | `Supply_Order` (10 rows), `ED_Barrie_OneDay` (30 rows) |
+| Week 4 · Cleaning messy data | TRIM, PROPER, UPPER, LEFT, VALUE, TEXTBEFORE/TEXTAFTER (blood pressure 120/80), IF, AND, OR, XLOOKUP, COUNTIF, NA/blank handling | `ED_Intake_Raw` (60-row raw export + Sites lookup sheet) |
+| Week 5 · Descriptive statistics and Tables | COUNT, AVERAGE, MEDIAN, MIN, MAX, range, VAR.S, STDEV.S, QUARTILE.INC, IQR, COUNTIFS crosstabs, Excel Tables | `ED_Visits_2025` (300 rows) |
+| Week 6 · Random numbers and dates | RAND, RANDBETWEEN, RANDARRAY, random samples; date arithmetic, DATEDIF, WEEKDAY, TEXT, EDATE, NETWORKDAYS | `ED_Visits_Dates` (300 rows) |
+
+Dana checks every number against a correct version of each dataset. For the messy Week 4 data she checks against a cleaned answer key (`data/ED_Intake_Clean.csv`), verified by recalculating a full set of cleaning formulas in a spreadsheet.
 
 ## Deploy on Streamlit Community Cloud (free)
 
@@ -37,4 +46,4 @@ streamlit run app.py
 
 ## Change the data
 
-`python make_dataset.py` regenerates `data/ED_Visits_2025.csv` (fixed seed, same result every time). To use your own file, replace the CSV and update `SCHEMA` and `NUMERIC` in `app.py` to match its columns.
+`python make_dataset.py` regenerates `data/ED_Visits_2025.csv`, and `python make_module_data.py` regenerates the Weeks 2–3, 4 and 6 files (fixed seeds, same result every time). Datasets are described in `DATASET_DESC` and wired up in `load_datasets()` and `MODULES` in `app.py`.

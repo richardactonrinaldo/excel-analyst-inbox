@@ -22,92 +22,243 @@ import streamlit as st
 from openpyxl.utils import get_column_letter
 
 SQL_APP = False
-DATA_PATH = Path(__file__).parent / "data" / "ED_Visits_2025.csv"
+DATA_DIR = Path(__file__).parent / "data"
 MAX_STUDENT_MESSAGES = 60      # per session; caps cost if someone leaves a script running
 MAX_WORKBOOK_CHARS = 20_000    # how much of an uploaded workbook Dana reads
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 st.set_page_config(page_title="Analyst Inbox", page_icon="📨", layout="wide")
 
 
+# ---------------------------------------------------------------- datasets
+# Each dataset has a "check" table Dana computes on, and a file the analyst gets. For most datasets the file
+# is the check table minus Dana's check-only columns; for the messy Week 4 data the file is the raw export.
+def _dates_check(df: pd.DataFrame) -> pd.DataFrame:
+    v, b, f = (pd.to_datetime(df[c]) for c in ("VisitDate", "DateOfBirth", "FollowUpDate"))
+    age = v.dt.year - b.dt.year - ((v.dt.month < b.dt.month) | ((v.dt.month == b.dt.month) & (v.dt.day < b.dt.day)))
+    df = df.copy()
+    df["AgeAtVisit"] = age                                   # = DATEDIF(DateOfBirth, VisitDate, "Y")
+    df["DaysToFollowUp"] = (f - v).dt.days                   # = FollowUpDate - VisitDate (blank if no follow-up)
+    df["VisitWeekday"] = v.dt.dayofweek.map(dict(enumerate(WEEKDAYS)))   # = TEXT(VisitDate, "ddd")
+    df["VisitWeekdayNum"] = (v.dt.dayofweek + 1) % 7 + 1     # = WEEKDAY(VisitDate) (1 = Sunday)
+    df["VisitMonthNum"] = v.dt.month                         # = MONTH(VisitDate)
+    df["FollowUpBooked"] = f.notna().map({True: "Yes", False: "No"})
+    return df
+
+
+def _supply_check(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["LineTotalCAD"] = (df.Quantity * df.UnitCostCAD).round(2)
+    df["HSTCAD"] = (df.LineTotalCAD * 0.13).round(2)
+    df["LineTotalWithHSTCAD"] = (df.LineTotalCAD * 1.13).round(2)
+    df["UnitCostChangePct"] = ((df.UnitCostCAD - df.LastYearUnitCostCAD) / df.LastYearUnitCostCAD * 100).round(2)
+    return df
+
+
 @st.cache_data
-def load_data() -> pd.DataFrame:
-    return pd.read_csv(DATA_PATH)
+def load_datasets() -> dict:
+    ed = pd.read_csv(DATA_DIR / "ED_Visits_2025.csv")
+    day = pd.read_csv(DATA_DIR / "ED_Barrie_OneDay.csv")
+    sup = pd.read_csv(DATA_DIR / "Supply_Order.csv")
+    intake = pd.read_csv(DATA_DIR / "ED_Intake_Clean.csv")
+    dates = pd.read_csv(DATA_DIR / "ED_Visits_Dates.csv")
+    return {
+        "ED_Barrie_OneDay": {"check": day, "file_cols": list(day.columns), "date_cols": [],
+                             "numeric": ["Age", "TriageLevel", "WaitTimeMin"]},
+        "Supply_Order": {"check": _supply_check(sup), "file_cols": list(sup.columns), "date_cols": [],
+                         "numeric": ["Quantity", "UnitCostCAD", "LastYearUnitCostCAD", "LineTotalCAD", "HSTCAD",
+                                     "LineTotalWithHSTCAD", "UnitCostChangePct"]},
+        "ED_Intake_Raw": {"check": intake, "file_path": DATA_DIR / "ED_Intake_Raw.xlsx",
+                          "file_cols": ["VisitID", "VisitRef", "PatientName", "Age", "Sex", "TriageLevel",
+                                        "BloodPressure", "WaitTimeMin"], "date_cols": [],
+                          "numeric": ["Age", "TriageLevel", "Systolic", "Diastolic", "WaitTimeMin"]},
+        "ED_Visits_2025": {"check": ed, "file_cols": list(ed.columns), "date_cols": ["VisitDate"],
+                           "numeric": ["Age", "TriageLevel", "WaitTimeMin", "LengthOfStayHrs", "CostCAD"]},
+        "ED_Visits_Dates": {"check": _dates_check(dates), "file_cols": list(dates.columns),
+                            "date_cols": ["VisitDate", "DateOfBirth", "FollowUpDate"],
+                            "numeric": ["TriageLevel", "AgeAtVisit", "DaysToFollowUp", "VisitWeekdayNum",
+                                        "VisitMonthNum"]},
+    }
 
 
-DF = load_data()
-NUMERIC = ["Age", "TriageLevel", "WaitTimeMin", "LengthOfStayHrs", "CostCAD"]
+DATASETS = load_datasets()
+ALL_FILE_COLUMNS = {c for d in DATASETS.values() for c in d["file_cols"]}
+
+
+def dataset(name: str | None) -> dict:
+    name = name or MODULES[st.session_state.topic]["datasets"][0]
+    if name not in DATASETS:
+        raise ValueError(f"Unknown dataset {name}. Use one of: {', '.join(MODULES[st.session_state.topic]['datasets'])}")
+    return DATASETS[name]
+
+
+@st.cache_data
+def raw_messy_facts() -> str:
+    """Exact counts of the mess planted in the Week 4 raw export, so Dana can check cleaning work."""
+    ws = openpyxl.load_workbook(DATA_DIR / "ED_Intake_Raw.xlsx")["Intake"]
+    rows = list(ws.iter_rows(min_row=2, values_only=True))
+    col = {h: i for i, h in enumerate(next(ws.iter_rows(max_row=1, values_only=True)))}
+
+    def tally(name):
+        out = {}
+        for r in rows:
+            v = r[col[name]]
+            is_reading = isinstance(v, (int, float)) or (isinstance(v, str) and re.fullmatch(r"\s*\d+(/\d+)?\s*", v))
+            k = "(blank)" if v is None else (None if is_reading else v)
+            if k is not None:
+                out[k] = out.get(k, 0) + 1
+        return out
+
+    sex = {}
+    for r in rows:
+        sex[r[col["Sex"]]] = sex.get(r[col["Sex"]], 0) + 1
+    spaced = sum(1 for r in rows if r[col["PatientName"]] != r[col["PatientName"]].strip())
+    spaced_age = sum(1 for r in rows if isinstance(r[col["Age"]], str) and r[col["Age"]] != r[col["Age"]].strip())
+    lower_ref = sum(1 for r in rows if r[col["VisitRef"]][:3].islower())
+    wait_na = tally("WaitTimeMin")
+    return (f"Raw export facts (sheet Intake, {len(rows)} rows, columns A-H = {', '.join(col)}): "
+            f"BloodPressure non-readings {tally('BloodPressure')}; WaitTimeMin non-numbers {wait_na}; "
+            f"Age is stored as TEXT in every row (needs VALUE), {spaced_age} ages have a leading space, "
+            f"Age non-numbers {tally('Age')}; "
+            f"Sex spellings {sex}; {spaced} PatientName values have extra leading/trailing spaces and names come in "
+            f"mixed case (PROPER fixes them); {lower_ref} VisitRef values start with a lower-case site code "
+            f"(the first 3 letters of VisitRef are the SiteCode: UPPER(LEFT(...,3)), then XLOOKUP on sheet Sites: "
+            f"SiteCode, SiteName, Beds). COUNTIF is not case-sensitive, so COUNTIF(G:G,\"NA\") counts NA but not n/a. "
+            f"Note: AVERAGE skips text and blanks, so the average wait of the raw column equals the clean average.")
 
 
 # ---------------------------------------------------------------- data helpers
-def apply_filters(df: pd.DataFrame, filters: list | None) -> pd.DataFrame:
+def apply_filters(df: pd.DataFrame, filters: list | None, numeric: list) -> pd.DataFrame:
     for f in filters or []:
-        col, op, val = f["column"], f["op"], f["value"]
+        col, op, val = f["column"], f["op"], f.get("value", "")
         if col not in df.columns:
-            raise ValueError(f"Unknown column {col}")
-        if col in NUMERIC:
+            raise ValueError(f"Unknown column {col}. Columns: {', '.join(df.columns)}")
+        if op == "is_blank":
+            df = df[df[col].isna()]
+            continue
+        if op == "not_blank":
+            df = df[df[col].notna()]
+            continue
+        if col in numeric:
             s, val = df[col], float(val)
         else:
             s, val = df[col].astype(str).str.lower(), str(val).lower()
         mask = {"=": s == val, "!=": s != val, ">": s > val, "<": s < val,
                 ">=": s >= val, "<=": s <= val}[op]
-        df = df[mask]
+        df = df[mask & df[col].notna()]
     return df
 
 
-def query_data(metric: str, column: str | None = None, filters: list | None = None,
-               group_by: str | None = None) -> dict:
-    """Compute a statistic the same way Excel does (STDEV.S, MEDIAN)."""
-    df = apply_filters(DF, filters)
-    if metric != "count" and column not in NUMERIC:
-        raise ValueError(f"{metric} needs a numeric column: {', '.join(NUMERIC)}")
+def query_data(metric: str, dataset_name: str | None = None, column: str | None = None, filters: list | None = None,
+               group_by: str | None = None, group_by2: str | None = None, bins: list | None = None) -> dict:
+    """Compute a statistic the same way Excel does (VAR.S, STDEV.S, MEDIAN, QUARTILE.INC). Blanks are skipped."""
+    ds = dataset(dataset_name)
+    df = apply_filters(ds["check"], filters, ds["numeric"])
+    if metric != "count" and column not in ds["numeric"]:
+        raise ValueError(f"{metric} needs a numeric column: {', '.join(ds['numeric'])}")
 
     def calc(d):
         if metric == "count":
-            return int(len(d))
-        s = d[column]
-        v = {"sum": s.sum(), "mean": s.mean(), "median": s.median(), "min": s.min(),
-             "max": s.max(), "stdev": s.std(ddof=1)}[metric]
-        return None if pd.isna(v) else round(float(v), 2)
+            return int(len(d) if column is None else d[column].notna().sum())
+        s = d[column].dropna()
+        if s.empty:
+            return None
+        v = {"sum": s.sum(), "mean": s.mean(), "median": s.median(), "min": s.min(), "max": s.max(),
+             "range": s.max() - s.min(), "var": s.var(ddof=1), "stdev": s.std(ddof=1),
+             "q1": s.quantile(0.25), "q3": s.quantile(0.75),
+             "iqr": s.quantile(0.75) - s.quantile(0.25)}[metric]
+        return None if pd.isna(v) else round(float(v), 4)
 
+    def keys(col, d):
+        if col not in ds["check"].columns:
+            raise ValueError(f"Unknown group_by column {col}")
+        present = d[col].dropna().unique()
+        order = MONTHS if col == "Month" else WEEKDAYS if col == "VisitWeekday" else sorted(present, key=str)
+        return [k for k in order if k in set(present)]
+
+    def py(k):
+        return k if isinstance(k, str) else int(k) if float(k).is_integer() else float(k)
+
+    if bins:
+        if column not in ds["numeric"]:
+            raise ValueError("bins needs a numeric column")
+        edges = sorted(float(b) for b in bins)
+        s = df[column].dropna()
+        out = [{"from": py(lo), "to_below": py(hi) if hi is not None else None,
+                "n": int(((s >= lo) & ((s < hi) if hi is not None else True)).sum())}
+               for lo, hi in zip(edges, edges[1:] + [None])]
+        return {"rows_matched": int(len(s)), "below_first_bin": int((s < edges[0]).sum()), "bins": out}
     if not group_by:
         return {"rows_matched": int(len(df)), "result": calc(df)}
-    if group_by not in DF.columns:
-        raise ValueError(f"Unknown group_by column {group_by}")
-    keys = MONTHS if group_by == "Month" else sorted(df[group_by].unique(), key=str)
-    groups = [{group_by: k if isinstance(k, str) else int(k), "n": int((df[group_by] == k).sum()),
-               "result": calc(df[df[group_by] == k])} for k in keys if (df[group_by] == k).any()]
+    groups = []
+    for k in keys(group_by, df):
+        g = df[df[group_by] == k]
+        item = {group_by: py(k), "n": int(len(g))}
+        if group_by2:
+            item["by_" + group_by2] = [{group_by2: py(k2), "result": calc(g[g[group_by2] == k2])}
+                                       for k2 in keys(group_by2, df)]
+        else:
+            item["result"] = calc(g)
+        groups.append(item)
     return {"rows_matched": int(len(df)), "groups": groups}
 
 
-def to_xlsx(df: pd.DataFrame, sheet: str = "Data") -> bytes:
-    """Excel file with a bold, frozen header row and sensible column widths."""
+def to_xlsx(df: pd.DataFrame, sheet: str = "Data", date_cols: list | None = None) -> bytes:
+    """Excel file with a bold, frozen header row, real dates and sensible column widths."""
+    df = df.copy()
+    for c in date_cols or []:
+        df[c] = pd.to_datetime(df[c]).dt.date
     buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+    with pd.ExcelWriter(buf, engine="openpyxl", date_format="yyyy-mm-dd") as xw:
         df.to_excel(xw, index=False, sheet_name=sheet)
         ws = xw.sheets[sheet]
         ws.freeze_panes = "A2"
         for i, col in enumerate(df.columns, 1):
             ws.cell(1, i).font = openpyxl.styles.Font(bold=True)
+            if col in (date_cols or []):
+                for (cell,) in ws.iter_rows(min_row=2, min_col=i, max_col=i):
+                    cell.number_format = "yyyy-mm-dd"
             width = max(len(str(col)), *(len(str(v)) for v in df[col].head(200))) + 2
-            ws.column_dimensions[get_column_letter(i)].width = min(width, 28)
+            ws.column_dimensions[get_column_letter(i)].width = min(width, 30)
     return buf.getvalue()
 
 
-def attach_dataset(filename: str, filters: list | None = None, columns: list | None = None) -> dict:
-    """Dana attaches the dataset (or an extract of it) to her message as an .xlsx file."""
-    df = apply_filters(DF, filters)
+def dataset_file(name: str, filters: list | None = None, columns: list | None = None) -> bytes:
+    ds = DATASETS[name]
+    if "file_path" in ds:
+        if filters or columns:
+            raise ValueError("The raw intake export can only be attached whole (no filters or columns).")
+        return ds["file_path"].read_bytes()
+    df = apply_filters(ds["check"], filters, ds["numeric"])[ds["file_cols"]]
     if columns:
-        missing = [c for c in columns if c not in DF.columns]
+        missing = [c for c in columns if c not in ds["file_cols"]]
         if missing:
             raise ValueError(f"Unknown columns: {missing}")
         df = df[columns]
     if df.empty:
         raise ValueError("No rows match those filters, so there's nothing to attach.")
-    name = re.sub(r"[^A-Za-z0-9_\-]+", "_", filename.removesuffix(".xlsx")).strip("_") or "ED_Visits_2025"
-    st.session_state.outbox.append({"name": f"{name}.xlsx", "data": to_xlsx(df), "mime": XLSX_MIME})
-    return {"attached": f"{name}.xlsx", "rows": int(len(df)), "columns": list(df.columns)}
+    return to_xlsx(df, date_cols=[c for c in ds["date_cols"] if c in df.columns])
+
+
+def attach_dataset(filename: str, dataset_name: str | None = None, filters: list | None = None,
+                   columns: list | None = None) -> dict:
+    """Dana attaches a dataset (or an extract of it) to her message as an .xlsx file."""
+    name = dataset_name or MODULES[st.session_state.topic]["datasets"][0]
+    if name not in MODULES[st.session_state.topic]["datasets"]:
+        raise ValueError(f"{name} isn't used this module. Use one of: "
+                         f"{', '.join(MODULES[st.session_state.topic]['datasets'])}")
+    data = dataset_file(name, filters, columns)
+    fname = re.sub(r"[^A-Za-z0-9_\-]+", "_", filename.removesuffix(".xlsx")).strip("_") or name
+    st.session_state.outbox.append({"name": f"{fname}.xlsx", "data": data, "mime": XLSX_MIME})
+    return {"attached": f"{fname}.xlsx", "dataset": name}
+
+
+def fmt_result(r) -> str:
+    if r is None:
+        return "(blank, or not calculated)"
+    return "(blank)" if r == "" else str(r)
 
 
 def read_workbook(data: bytes, filename: str) -> str:
@@ -133,9 +284,12 @@ def read_workbook(data: bytes, filename: str) -> str:
         header = [str(c.value) for c in ws_f[1] if c.value is not None]
         has_pivot = bool(getattr(ws_f, "_pivots", None))
         big = (not has_pivot and rows > 60
-               and len(set(header) & set(DF.columns)) >= min(5, len(header)) and len(header) >= 3)
+               and len(set(header) & ALL_FILE_COLUMNS) >= min(5, len(header)) and len(header) >= 3)
         if big:
-            out.append(f"Raw data sheet. Header row: {', '.join(header)}. Showing only formula cells:")
+            out.append(f"Raw data sheet ({rows - 1} data rows). Header row: {', '.join(header)}. "
+                       "Raw values aren't shown. Formula columns are summarised: the first few formulas, "
+                       "then a summary of every result in that column.")
+        by_col = {}
         for row in ws_f.iter_rows():
             for c in row:
                 if c.value is None:
@@ -149,53 +303,92 @@ def read_workbook(data: bytes, filename: str) -> str:
                 if isinstance(val, str):
                     # Strip Excel's internal prefixes so Dana sees =STDEV.S(FILTER(...)), not _xlfn._xlws.
                     val = val.replace("_xlfn._xlws.", "").replace("_xlfn.", "").replace("_xlws.", "")
-                c_value = val
                 is_formula = isinstance(val, str) and val.startswith("=")
-                if big and not is_formula:
+                result = ws_v[c.coordinate].value if is_formula else None
+                if big:
+                    if is_formula:
+                        by_col.setdefault(c.column_letter, []).append((c.coordinate, val, result))
                     continue
                 if is_formula:
-                    result = ws_v[c.coordinate].value
-                    out.append(f"{c.coordinate}: {c_value}  -> {result if result is not None else '(not calculated)'}")
+                    out.append(f"{c.coordinate}: {val}  -> {fmt_result(result)}")
                 else:
-                    out.append(f"{c.coordinate}: {c_value}")
+                    out.append(f"{c.coordinate}: {val}")
+        for letter, cells in by_col.items():
+            head = ws_f[f"{letter}1"].value
+            out.append(f"Column {letter}" + (f" ('{head}')" if head is not None else "") + f": {len(cells)} formula cells")
+            for coord, f_, r in cells[:3]:
+                out.append(f"  {coord}: {f_}  -> {fmt_result(r)}")
+            if len(cells) > 3:
+                res = [r for _, _, r in cells]
+                nums = [r for r in res if isinstance(r, (int, float)) and not isinstance(r, bool)]
+                texts = {}
+                for r in res:
+                    if isinstance(r, str) or r is None:
+                        key = "(empty)" if r in (None, "") else r
+                        texts[key] = texts.get(key, 0) + 1
+                summary = f"  All {len(res)} results: {len(nums)} numbers"
+                if nums:
+                    summary += (f" (sum {round(sum(nums), 4)}, mean {round(sum(nums) / len(nums), 4)}, "
+                                f"min {min(nums)}, max {max(nums)})")
+                if texts:
+                    top = sorted(texts.items(), key=lambda kv: -kv[1])[:8]
+                    summary += "; text/empty results: " + ", ".join(f"{k!s} x{v}" for k, v in top)
+                patterns = {re.sub(r"(?<![A-Za-z])([A-Z]{1,3})\$?\d+", r"\1#", f_) for _, f_, _ in cells}
+                if len(patterns) > 1:
+                    summary += f"; {len(patterns)} different formula patterns in this column"
+                out.append(summary)
         text = "\n".join(out)
         if len(text) > MAX_WORKBOOK_CHARS:
             return text[:MAX_WORKBOOK_CHARS] + "\n[Workbook truncated: too large to show in full.]"
     return "\n".join(out)
 
 
+FILTER_SCHEMA = {"type": "array", "items": {"type": "object", "properties": {
+    "column": {"type": "string"},
+    "op": {"type": "string", "enum": ["=", "!=", ">", "<", ">=", "<=", "is_blank", "not_blank"]},
+    "value": {"type": ["string", "number"], "description": "Not needed for is_blank / not_blank"}},
+    "required": ["column", "op"]}}
+
 TOOLS = [
     {
         "name": "query_data",
-        "description": "Compute a statistic on ED_Visits_2025, the same way Excel would (stdev = STDEV.S, "
-                       "median = MEDIAN). Use it to check every number the analyst reports before commenting.",
+        "description": "Compute a statistic on one of this module's datasets, the same way Excel would "
+                       "(var = VAR.S, stdev = STDEV.S, median = MEDIAN, q1/q3 = QUARTILE.INC; blanks are skipped). "
+                       "Use it to check every number the analyst reports before commenting. "
+                       "group_by gives one result per category; add group_by2 for a crosstab (like COUNTIFS on two "
+                       "columns). bins gives a grouped frequency table: pass the lower bound of each class, e.g. "
+                       "[0, 30, 60, 90] for 0-29, 30-59, 60-89, 90 and over.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "metric": {"type": "string", "enum": ["count", "sum", "mean", "median", "min", "max", "stdev"]},
-                "column": {"type": "string", "description": "Numeric column (not needed for count): " + ", ".join(NUMERIC)},
-                "filters": {"type": "array", "items": {"type": "object", "properties": {
-                    "column": {"type": "string"}, "op": {"type": "string", "enum": ["=", "!=", ">", "<", ">=", "<="]},
-                    "value": {"type": ["string", "number"]}}, "required": ["column", "op", "value"]}},
-                "group_by": {"type": "string", "description": "Optional: Site, Month, TriageLevel, Disposition, AgeGroup, Sex, ChiefComplaint"},
+                "dataset_name": {"type": "string", "enum": list(DATASETS),
+                                 "description": "Defaults to this module's first dataset"},
+                "metric": {"type": "string", "enum": ["count", "sum", "mean", "median", "min", "max", "range",
+                                                      "var", "stdev", "q1", "q3", "iqr"]},
+                "column": {"type": "string", "description": "Numeric column (count needs none; with a column, "
+                                                            "count = non-blank cells, like COUNT)"},
+                "filters": FILTER_SCHEMA,
+                "group_by": {"type": "string"},
+                "group_by2": {"type": "string"},
+                "bins": {"type": "array", "items": {"type": "number"}},
             },
             "required": ["metric"],
         },
     },
     {
         "name": "attach_dataset",
-        "description": "Attach an Excel file to your message: the full ED visits dataset, or an extract filtered "
-                       "to the rows (and optionally columns) a request needs. The analyst downloads it from your message.",
+        "description": "Attach an Excel file to your message: one of this module's datasets, or an extract "
+                       "filtered to the rows (and optionally columns) a request needs. The analyst downloads it "
+                       "from your message. Check-only columns are never included in the file.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "filename": {"type": "string", "description": "Realistic work file name, e.g. ED_Visits_2025 or ED_Barrie_Q1_2025"},
-                "filters": {"type": "array", "items": {"type": "object", "properties": {
-                    "column": {"type": "string"}, "op": {"type": "string", "enum": ["=", "!=", ">", "<", ">=", "<="]},
-                    "value": {"type": ["string", "number"]}}, "required": ["column", "op", "value"]}},
+                "filename": {"type": "string", "description": "Realistic work file name, e.g. ED_Barrie_15Mar"},
+                "dataset_name": {"type": "string", "enum": list(DATASETS)},
+                "filters": FILTER_SCHEMA,
                 "columns": {"type": "array", "items": {"type": "string"}, "description": "Optional subset of columns, in order"},
             },
-            "required": ["filename"],
+            "required": ["filename", "dataset_name"],
         },
     },
 ]
@@ -221,53 +414,149 @@ TOOLS.append(OPEN_REQUEST_TOOL)
 TOOL_FUNCS = {"query_data": query_data, "attach_dataset": attach_dataset, "open_request": open_request}
 
 # ---------------------------------------------------------------- persona
-TOPICS = {
-    "Module A · Descriptive statistics": (
-        "Descriptive statistics in Excel: AVERAGE, MEDIAN, MIN, MAX, COUNT, COUNTIF, COUNTIFS, AVERAGEIF, "
-        "STDEV.S. Requests should need 2-4 numbers, sometimes split by one category (a site or triage level)."),
-    "Module B · PivotTables": (
-        "PivotTables in Excel: counts and averages broken down by one or two categories (Site, Month, "
-        "TriageLevel, Disposition, AgeGroup). Ask for a small summary table and one observation from it."),
-    "Module C · Charts and visualizations": (
-        "Charts in Excel: column/bar to compare categories, line for trends by Month, pie only for 2-4 parts "
-        "of a whole. Ask for one chart for a specific audience. Judge chart choice, title, axis labels, "
-        "sorting, and whether an executive gets the point in 5 seconds. Charts can't be seen inside an "
-        "uploaded workbook, so ask for a screenshot of the chart."),
-    "Module D · Presenting results": (
-        "Presenting results: the analyst writes a 3-5 sentence summary or 3 talking points for the VP of "
-        "Patient Care. Coach on leading with the answer, plain language, one key number per point, the "
-        "'so what', and a recommendation. After their summary, play the VP for one tough question, then "
-        "step back out as Dana to give feedback."),
+DATASET_DESC = {
+    "ED_Barrie_OneDay": (
+        "ED_Barrie_OneDay: 30 rows, every visit to the Barrie ED on 15 March 2025 (fictional). Columns: VisitID, "
+        "Age, Sex (F, M), TriageLevel (CTAS 1-5; 1 = most urgent), WaitTimeMin (minutes from triage to physician)."),
+    "Supply_Order": (
+        "Supply_Order: 10 rows, the ED's monthly supply order. Columns: Item, Quantity, UnitCostCAD (this year's "
+        "price), LastYearUnitCostCAD. Check-only columns (not in the analyst's file, for checking their formulas): "
+        "LineTotalCAD = Quantity x UnitCostCAD, HSTCAD = 13% of the line total, LineTotalWithHSTCAD, "
+        "UnitCostChangePct = (this year - last year) / last year x 100. Ontario HST is 13%."),
+    "ED_Intake_Raw": (
+        "ED_Intake_Raw: the analyst's file is a raw export with two sheets. Sheet 'Intake' (60 rows): VisitID, "
+        "VisitRef (e.g. BAR-2025-0012; first 3 letters = site code, case varies), PatientName (\"LAST, FIRST\", "
+        "mixed case, some extra spaces), Age (stored as text; some NA), Sex (F, f, Female, male...), TriageLevel, "
+        "BloodPressure (text like 120/80; some NA, n/a or blank), WaitTimeMin (some NA or blank). Sheet 'Sites': "
+        "SiteCode, SiteName, Beds. You check against the CLEANED version, which has columns VisitID, SiteCode, "
+        "SiteName, PatientName (proper case, trimmed), Age (number, blank if NA), Sex (F/M), TriageLevel, Systolic, "
+        "Diastolic (numbers from BloodPressure, blank if missing), BPCategory (High if Systolic >= 140 OR "
+        "Diastolic >= 90; Normal if Systolic < 120 AND Diastolic < 80; otherwise Elevated; blank if no reading), "
+        "WaitTimeMin (blank if NA)."),
+    "ED_Visits_2025": (
+        "ED_Visits_2025: 300 rows, one per emergency department visit in 2025 (fictional): VisitID, VisitDate, "
+        "Month (Jan..Dec), Site (Barrie, Orillia, Midland, Collingwood), Age, AgeGroup (0-17, 18-39, 40-64, 65+), "
+        "Sex (F, M), TriageLevel (CTAS 1-5; 1 = most urgent), ChiefComplaint (Abdominal pain, Chest pain, "
+        "Shortness of breath, Injury/Fracture, Fever, Headache, Laceration, Mental health), WaitTimeMin, "
+        "LengthOfStayHrs, Disposition (Discharged, Admitted, LWBS = left without being seen, Transferred), CostCAD."),
+    "ED_Visits_Dates": (
+        "ED_Visits_Dates: 300 rows (the same 2025 visits): VisitID, VisitDate, DateOfBirth, Site, TriageLevel, "
+        "FollowUpDate (blank when no follow-up was booked; about 70% have one). All dates are real Excel dates. "
+        "Check-only columns: AgeAtVisit (= DATEDIF(DateOfBirth, VisitDate, \"Y\")), DaysToFollowUp (= FollowUpDate "
+        "- VisitDate, blank if none), VisitWeekday (Mon..Sun, = TEXT(VisitDate,\"ddd\")), VisitWeekdayNum "
+        "(= WEEKDAY(VisitDate), 1 = Sunday), VisitMonthNum (= MONTH(VisitDate)), FollowUpBooked (Yes/No)."),
 }
 
-SCHEMA = (
-    "Dataset ED_Visits_2025, 300 rows, one per emergency department visit (fictional data): "
-    "VisitID, VisitDate (2025-01-01 to 2025-12-31), Month (Jan..Dec), Site (Barrie, Orillia, Midland, "
-    "Collingwood), Age, AgeGroup (0-17, 18-39, 40-64, 65+), Sex (F, M), TriageLevel (CTAS 1-5; 1 = most "
-    "urgent), ChiefComplaint (Abdominal pain, Chest pain, Shortness of breath, Injury/Fracture, Fever, "
-    "Headache, Laceration, Mental health), WaitTimeMin (minutes from triage to physician), "
-    "LengthOfStayHrs, Disposition (Discharged, Admitted, LWBS = left without being seen, Transferred), CostCAD."
-)
+MODULES = {
+    "Weeks 2–3 · Arithmetic and frequency tables": {
+        "datasets": ["ED_Barrie_OneDay", "Supply_Order"],
+        "focus": (
+            "Basic Excel arithmetic: + - * /, percentages, number formats (currency, percent, decimal places), and "
+            "relative vs absolute references ($A$1, and mixed references like $A1 or A$1). Then frequency "
+            "distributions built WITHOUT counting functions (no COUNTIF, COUNTIFS, FREQUENCY or PivotTables): "
+            "the analyst sorts the small dataset and counts by hand, then uses formulas for relative frequency "
+            "(f / total), cumulative frequency, and relative cumulative frequency. Also a grouped frequency table, "
+            "e.g. WaitTimeMin in classes of 30 minutes. Use Supply_Order for the arithmetic requests (line totals, "
+            "HST at 13% kept in ONE cell and referenced absolutely, percent of total order, percent change from "
+            "last year) and ED_Barrie_OneDay for the frequency tables (TriageLevel, Age or WaitTimeMin)."),
+        "rules": (
+            "- In this module, the frequency COUNTS themselves may be typed (they come from sorting and counting), "
+            "but every total, relative, cumulative and percentage cell must be a formula. Check typed counts with "
+            "query_data (group_by or bins). If they used COUNTIF/COUNTIFS, say kindly that it works but this week "
+            "is about building the table by hand; it comes in a later week.\n"
+            "- Absolute references are central this week. When a formula refers to a total or the HST rate, check "
+            "for the $ and ask what would break without it if they dragged the formula down.\n"
+            "- Watch the classic mistakes: relative frequencies that don't sum to 1 (or 100%), the last cumulative "
+            "frequency not equal to the total, overlapping class limits (0-30, 30-60), percentages stored as 13 "
+            "instead of 0.13 or 13%, and rounding with formatting vs ROUND."),
+    },
+    "Week 4 · Cleaning messy data": {
+        "datasets": ["ED_Intake_Raw"],
+        "focus": (
+            "Cleaning a messy raw export in Excel: TRIM, PROPER, UPPER, LEFT, VALUE, TEXTBEFORE and TEXTAFTER "
+            "(split BloodPressure 120/80 into Systolic and Diastolic, then VALUE), IF, AND, OR (e.g. a blood pressure "
+            "category or a flag), XLOOKUP (site name from the site code via the Sites sheet), COUNTIF to count "
+            "problems such as NA, and handling missing data (NA, n/a, blanks) so it doesn't break formulas "
+            "(IF(G2=\"NA\",\"\",...), IFERROR, or checking with ISNUMBER). One request = one cleaning task with a "
+            "clear check number at the end (e.g. 'how many readings are High?', 'average systolic?', 'how many "
+            "visits were at Orillia?')."),
+        "rules": (
+            "- Attach ED_Intake_Raw (whole file) with the first request. Later requests keep working on the same "
+            "file.\n"
+            "- The analyst's workbook will be large. You'll see each formula column summarised (first formulas plus "
+            "a summary of all results). Use the summary to check: compare their counts and averages with "
+            "query_data on the cleaned dataset, e.g. count where BPCategory = High, mean of Systolic, count where "
+            "Age is_blank.\n"
+            "- Use the raw export facts below to check counting tasks (how many NA, how many spellings of Sex). "
+            "If their count is off by the n/a or blank rows, hint that COUNTIF(...,\"NA\") misses n/a and blanks, "
+            "and ask how they'd catch those.\n"
+            "- Good habits to coach: keep the raw column and clean into a new column, never type over raw data; "
+            "decide what NA should become (blank, not 0) and explain why 0 would distort an average."),
+    },
+    "Week 5 · Descriptive statistics and Tables": {
+        "datasets": ["ED_Visits_2025"],
+        "focus": (
+            "Descriptive statistics in Excel: COUNT, AVERAGE, MEDIAN, MIN, MAX, range (MAX-MIN), VAR.S, STDEV.S, "
+            "QUARTILE.INC for Q1 and Q3, and IQR (Q3-Q1). COUNTIFS to build frequency crosstabs (e.g. Site by "
+            "Disposition, or AgeGroup by TriageLevel) with labelled rows and columns and mixed references. Excel "
+            "Tables (Ctrl+T) and structured references like Table1[WaitTimeMin]. Requests need 2-4 numbers, "
+            "sometimes split by one category, or one small crosstab."),
+        "rules": (
+            "- Check quartiles with q1/q3 (QUARTILE.INC). If their Q1/Q3 differ slightly, ask whether they used "
+            "QUARTILE.EXC.\n"
+            "- For crosstabs, check with query_data(metric='count', group_by=..., group_by2=...). Ask them to add "
+            "row and column totals that match the grand total."),
+    },
+    "Week 6 · Random numbers and dates": {
+        "datasets": ["ED_Visits_Dates"],
+        "focus": (
+            "Random numbers in Excel: RAND, RANDBETWEEN, RANDARRAY; drawing a random sample of visits for a chart "
+            "audit (add a RAND() column and sort by it, or SORTBY/TAKE); why the numbers change on every "
+            "recalculation and how to freeze them (Paste Special > Values). Dates in Excel: dates are serial "
+            "numbers; TODAY, YEAR, MONTH, DAY, WEEKDAY, TEXT(date,\"ddd\") or \"mmm\", date arithmetic (days between "
+            "two dates), DATEDIF for age in years, EDATE, NETWORKDAYS; and summarising by date parts (visits by "
+            "weekday or month, with COUNTIFS on a helper column)."),
+        "rules": (
+            "- Random results can't be checked against fixed numbers. Check the METHOD instead: the formula, the "
+            "range (e.g. RANDBETWEEN(1,300) gives whole numbers 1-300), sample size, no duplicate visits in a sample, "
+            "and that they froze the values before reporting. Ask what would happen if they pressed F9.\n"
+            "- Check date work with the check-only columns: AgeAtVisit, DaysToFollowUp, VisitWeekday/VisitWeekdayNum, "
+            "VisitMonthNum, FollowUpBooked. If their ages are 1 too high for some rows, they probably did "
+            "YEAR(VisitDate)-YEAR(DateOfBirth); hint at birthdays later in the year.\n"
+            "- Watch for: days-between showing as a date (needs General/Number format), WEEKDAY numbering (1 = "
+            "Sunday by default), blank FollowUpDate giving a huge negative number, and TODAY() making results "
+            "change from day to day."),
+    },
+}
+TOPICS = {k: v["focus"] for k, v in MODULES.items()}   # used by the sidebar and the check-in
+
+
+def schema_text(topic: str) -> str:
+    names = MODULES[topic]["datasets"]
+    text = "Datasets for this module (fictional data):\n" + "\n".join(f"- {DATASET_DESC[n]}" for n in names)
+    if "ED_Intake_Raw" in names:
+        text += "\n" + raw_messy_facts()
+    return text
 
 
 def system_prompt(topic: str, student: str) -> str:
     return f"""You are Dana Morgan, Manager of Decision Support at Lakeshore Regional Health, a fictional hospital network in Central Ontario. You are chatting with {student}, a junior healthcare data analyst on your team. In reality they are a college student in a health informatics course, a beginner with Microsoft 365 Excel. Stay in character the whole time.
 
-{SCHEMA}
+{schema_text(topic)}
 
-This module's focus: {TOPICS[topic]}
+This module's focus: {MODULES[topic]['focus']}
 
 How you work:
 - Write like a busy, supportive manager in a work chat: short, plain, friendly. Under 150 words per reply, except a new request may run to 200. No headings. Short bullet lists are fine.
 - Each request gives: why you need it (business context), the specific question(s), who it's for, and when (e.g. "by end of day"). Ask for at most 3 things per request.
 - Every new request (including the first) ends with one prediction question to answer BEFORE they start, e.g. "Before you start: do you expect Barrie's median wait to be above or below its average? Why?" Also call open_request with a short title and that question: the app shows them a prediction box and won't accept their results for the request until they've answered it. Their answer arrives as a message starting with "[Prediction]". Don't say whether it's right; just acknowledge it ("Noted, let's see what the data says") and let them get to work. When their results come in, compare them with the prediction and ask what surprised them, if anything.
-- Stay within this module's Excel skills and a beginner's level. "A little harder" means a new question, an extra split or a judgement call using the same functions, never new techniques (no array formulas, MEDIAN(IF()), macros, or features from a later module).
+- Stay within this module's Excel skills and a beginner's level. "A little harder" means a new question, an extra split or a judgement call using the same functions, never new techniques (no macros, no functions from a later module). Requests and their data come from Lakeshore's ED and its supplies.
 - If you write your message and then call a tool, don't repeat that message after the tool result. Add only what's new, or nothing.
-- Send data with attach_dataset. Attach the full dataset (filename ED_Visits_2025) with your first request. Later requests may come with a focused extract (one site, one quarter, fewer columns) when that fits. Every attachment goes in the same message as the full request it belongs to: never send a file without saying exactly what to do with it.
+- Send data with attach_dataset, naming the dataset. Attach the dataset a request needs with your first request, and again whenever a request switches to another dataset. Later requests may come with a focused extract (one site, one quarter, fewer columns) when that fits. Every attachment goes in the same message as the full request it belongs to: never send a file without saying exactly what to do with it.
 - One thing at a time. Don't stack a new request on top of an unfinished one. When you ask a follow-up question, wait for the answer, respond to it, and only then send the next request.
 - Now and then leave one detail a little vague so the analyst has to ask a clarifying question. Answer clarifying questions the way a real manager would.
-- Numbers count only when they come in the analyst's uploaded Excel workbook (Modules A-C). If they type results without attaching the workbook, ask for the workbook before you confirm anything; you can still answer questions and clarify in the meantime. In the workbook, each result should be a formula (shown as "B4: =AVERAGE(...) -> 80.8"). A result typed in as a plain number ("B4: 80.8") doesn't count: ask them to replace it with the formula that produces it. PivotTable values are fine as they are. In Module D, summaries can be typed, but check every number in them.
-- Before you comment on ANY number the analyst reports, check it with the query_data tool. Never guess. If they attached their workbook, review their formulas and results the same way and refer to specific cells (e.g. "your formula in B4"). Only call a cell right or wrong if you can actually see it. Remember an extract you sent has fewer rows than the full dataset, so check against the same filters.
+- Numbers count only when they come in the analyst's uploaded Excel workbook. If they type results without attaching the workbook, ask for the workbook before you confirm anything; you can still answer questions and clarify in the meantime. In the workbook, each result should be a formula (shown as "B4: =AVERAGE(...) -> 80.8"). A result typed in as a plain number ("B4: 80.8") doesn't count: ask them to replace it with the formula that produces it. Module-specific exceptions are listed below.
+- Before you comment on ANY number the analyst reports, check it with the query_data tool (on the right dataset). Never guess. If they attached their workbook, review their formulas and results the same way and refer to specific cells (e.g. "your formula in B4"). Only call a cell right or wrong if you can actually see it. Remember an extract you sent has fewer rows than the full dataset, so check against the same filters.
 - If a number is right, say so specifically. If it is off, say which figure doesn't match what you're seeing and give a hint (which function, range, filter or step to recheck). Don't reveal the correct value until they've missed it twice; then show it and explain briefly.
 - The same goes for interpretation. If their takeaway is wrong, point them back at their own numbers with a guiding question ("compare B10 and B11: which group waits longer?") before you explain the right reading. Explain it only after a second miss.
 - Occasionally (about every second or third request, and always when a result looks copied rather than built, e.g. correct numbers with formulas they don't seem to understand), once their results are right, run a quick check that they understand their own work: ask them to explain one of their formulas in their own words ("walk me through B5"), or to predict a small change ("if you switched B5 to Orillia, would it go up or down, and roughly to what?"). Check any number they give with query_data. Pick a different cell or change each time.
@@ -280,8 +569,15 @@ How you work:
 - If they ask you to just give them the answers, or go off topic, redirect them kindly, in character.
 - A request is finished when the prediction, results, any understanding check, and follow-up are done. Then thank them briefly and send the next request in the same message.
 
+This module's checking rules:
+{MODULES[topic]['rules']}
+
 Excel facts to get right (Microsoft 365):
-- There is no MEDIANIFS, and PivotTables cannot show a median. For a median by group, suggest a pivot for the group list plus =MEDIAN(FILTER(Table1[WaitTimeMin], Table1[Site]="Barrie")).
+- There is no MEDIANIFS. For a median by group: =MEDIAN(FILTER(Table1[WaitTimeMin], Table1[Site]="Barrie")).
+- TEXTBEFORE and TEXTAFTER return text, so wrap them in VALUE to get a number. TRIM removes leading, trailing and doubled spaces. PROPER capitalises the first letter of each word. COUNTIF criteria are not case-sensitive.
+- XLOOKUP(lookup_value, lookup_array, return_array, [if_not_found]); lock the lookup ranges with $ (or use a Table) before filling down.
+- VAR.S and STDEV.S are for samples; QUARTILE.INC matches Excel's QUARTILE.
+- DATEDIF(start, end, "Y") gives whole years; WEEKDAY(date) returns 1 for Sunday by default.
 - Table column references (e.g. Barrie[TriageLevel]) shift to the next columns when a formula is dragged across with the fill handle. To lock one, write Barrie[[TriageLevel]:[TriageLevel]].
 - Never guess the analyst's sheet names, table names, column letters or ranges. Use what you can see in their workbook, or ask.
 - Never mention that you are an AI, a simulation or a tool."""
@@ -512,6 +808,8 @@ if "student" not in st.session_state:
     st.stop()
 
 # ---------------------------------------------------------------- sidebar
+if st.session_state.topic not in TOPICS:   # a session saved under an older module list
+    reset(next(iter(TOPICS)))
 with st.sidebar:
     st.subheader("This module's focus")
     topic = st.selectbox("Focus", list(TOPICS), index=list(TOPICS).index(st.session_state.topic),
@@ -544,8 +842,9 @@ with st.sidebar:
                "reloads or you come back later, enter these digits to continue.")
 
     with st.expander("Lost Dana's file?"):
-        st.download_button("Download the full dataset", to_xlsx(DF), "ED_Visits_2025.xlsx", XLSX_MIME,
-                           width="stretch")
+        for name in MODULES[st.session_state.topic]["datasets"]:
+            st.download_button(f"Download {name}", dataset_file(name), f"{name}.xlsx", XLSX_MIME,
+                               width="stretch", key=f"lost_{name}")
 
 # ---------------------------------------------------------------- chat
 st.markdown("#### Dana Morgan")
@@ -608,7 +907,8 @@ if not st.session_state.chat:
         with st.spinner("Dana is typing…"):
             reply, files = ask_dana()
         if not files:  # make sure the analyst always gets the data with the first request
-            files = [{"name": "ED_Visits_2025.xlsx", "data": to_xlsx(DF), "mime": XLSX_MIME}]
+            first = MODULES[st.session_state.topic]["datasets"][0]
+            files = [{"name": f"{first}.xlsx", "data": dataset_file(first), "mime": XLSX_MIME}]
         post_dana(reply, files)
         st.rerun()
     except anthropic.APIError as e:
