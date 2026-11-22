@@ -14,6 +14,7 @@ import secrets
 import time
 import calendar
 from datetime import date, datetime
+from decimal import ROUND_HALF_UP, Decimal
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
@@ -32,6 +33,12 @@ MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", 
 WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 st.set_page_config(page_title="Analyst Inbox", page_icon="📨", layout="wide")
+
+
+def excel_round(x, digits=0):
+    """ROUND the way Excel does it (halves away from zero), not Python's banker's rounding."""
+    q = Decimal(1).scaleb(-int(digits))
+    return float(Decimal(repr(float(x))).quantize(q, rounding=ROUND_HALF_UP))
 
 
 # ---------------------------------------------------------------- datasets
@@ -73,10 +80,11 @@ def _dates_check(df: pd.DataFrame) -> pd.DataFrame:
 
 def _supply_check(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["LineTotalCAD"] = (df.Quantity * df.UnitCostCAD).round(2)
-    df["HSTCAD"] = (df.LineTotalCAD * 0.13).round(2)
-    df["LineTotalWithHSTCAD"] = (df.LineTotalCAD * 1.13).round(2)
-    df["UnitCostChangePct"] = ((df.UnitCostCAD - df.LastYearUnitCostCAD) / df.LastYearUnitCostCAD * 100).round(2)
+    df["LineTotalCAD"] = [excel_round(q * u, 2) for q, u in zip(df.Quantity, df.UnitCostCAD)]
+    df["HSTCAD"] = [excel_round(t * 0.13, 2) for t in df.LineTotalCAD]              # =ROUND(E2*$A$14,2)
+    df["LineTotalWithHSTCAD"] = [excel_round(t + h, 2) for t, h in zip(df.LineTotalCAD, df.HSTCAD)]
+    df["Unrounded_HSTCAD"] = df.LineTotalCAD * 0.13                                     # =E2*$A$14, no ROUND
+    df["UnitCostChangePct"] = ((df.UnitCostCAD - df.LastYearUnitCostCAD) / df.LastYearUnitCostCAD * 100).round(4)
     return df
 
 
@@ -92,7 +100,7 @@ def load_datasets() -> dict:
                              "numeric": ["Age", "TriageLevel", "WaitTimeMin"]},
         "Supply_Order": {"check": _supply_check(sup), "file_cols": list(sup.columns), "date_cols": [],
                          "numeric": ["Quantity", "UnitCostCAD", "LastYearUnitCostCAD", "LineTotalCAD", "HSTCAD",
-                                     "LineTotalWithHSTCAD", "UnitCostChangePct"]},
+                                     "LineTotalWithHSTCAD", "Unrounded_HSTCAD", "UnitCostChangePct"]},
         "ED_Intake_Raw": {"check": intake, "file_path": DATA_DIR / "ED_Intake_Raw.xlsx",
                           "file_cols": ["VisitID", "VisitRef", "PatientName", "Age", "Sex", "TriageLevel",
                                         "BloodPressure", "WaitTimeMin"], "date_cols": [],
@@ -292,7 +300,8 @@ def read_workbook(data: bytes, filename: str) -> str:
         wb_v = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
     except Exception:
         return f"[The analyst attached {filename}, but it couldn't be opened. Ask them to re-save it as .xlsx.]"
-    out = [f"[The analyst attached the workbook {filename}. Sheets: {', '.join(wb_f.sheetnames)}.]"]
+    out = [f"[The analyst attached the workbook {filename}. Sheets: {', '.join(wb_f.sheetnames)}. "
+           "Cells show their number format in [format ...] when it isn't General.]"]
     for ws_f in wb_f.worksheets:
         ws_v = wb_v[ws_f.title]
         rows, cols = ws_f.max_row, ws_f.max_column
@@ -333,15 +342,17 @@ def read_workbook(data: bytes, filename: str) -> str:
                     if is_formula:
                         by_col.setdefault(c.column_letter, []).append((c.coordinate, val, result))
                     continue
+                fmt = "" if c.number_format in ("General", None) else f"  [format {c.number_format}]"
                 if is_formula:
-                    out.append(f"{c.coordinate}: {val}  -> {fmt_result(result)}")
+                    out.append(f"{c.coordinate}: {val}  -> {fmt_result(result)}{fmt}")
                 else:
-                    out.append(f"{c.coordinate}: {val}")
+                    out.append(f"{c.coordinate}: {val}{fmt}")
         for letter, cells in by_col.items():
             head = ws_f[f"{letter}1"].value
             out.append(f"Column {letter}" + (f" ('{head}')" if head is not None else "") + f": {len(cells)} formula cells")
             for coord, f_, r in cells[:3]:
-                out.append(f"  {coord}: {f_}  -> {fmt_result(r)}")
+                nf = ws_f[coord].number_format
+                out.append(f"  {coord}: {f_}  -> {fmt_result(r)}" + ("" if nf == "General" else f"  [format {nf}]"))
             if len(cells) > 3:
                 res = [r for _, _, r in cells]
                 nums = [r for r in res if isinstance(r, (int, float)) and not isinstance(r, bool)]
@@ -440,17 +451,10 @@ TOOLS.append(OPEN_REQUEST_TOOL)
 import ast
 import math
 import operator
-from decimal import ROUND_HALF_UP, Decimal
 
 _BIN = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv,
         ast.Pow: operator.pow, ast.Mod: operator.mod}
 _UN = {ast.USub: operator.neg, ast.UAdd: operator.pos}
-
-
-def excel_round(x, digits=0):
-    """ROUND the way Excel does it (halves away from zero), not Python's banker's rounding."""
-    q = Decimal(1).scaleb(-int(digits))
-    return float(Decimal(repr(x)).quantize(q, rounding=ROUND_HALF_UP))
 
 
 def _eval(node, row):
@@ -541,8 +545,12 @@ DATASET_DESC = {
     "Supply_Order": (
         "Supply_Order: 10 rows, the ED's monthly supply order. Columns: Item, Quantity, UnitCostCAD (this year's "
         "price), LastYearUnitCostCAD. Check-only columns (not in the analyst's file, for checking their formulas): "
-        "LineTotalCAD = Quantity x UnitCostCAD, HSTCAD = 13% of the line total, LineTotalWithHSTCAD, "
-        "UnitCostChangePct = (this year - last year) / last year x 100. Ontario HST is 13%."),
+        "LineTotalCAD = Quantity x UnitCostCAD, HSTCAD = 13% of the line total rounded to cents, "
+        "LineTotalWithHSTCAD = LineTotalCAD + HSTCAD, Unrounded_HSTCAD = 13% with no rounding, UnitCostChangePct "
+        "= (this year - last year) / last year x 100. Ontario HST is 13%. Rounding: summing per-line HST rounded "
+        "to cents gives a grand total with HST of $3,848.45; taking the order total x 1.13 gives $3,848.44 (the "
+        "Hand sanitizer line's HST is exactly 43.875). Both are defensible; an itemized invoice rounds each line. "
+        "Accept either if the analyst can explain it, and don't call one of them wrong."),
     "ED_Intake_Raw": (
         "ED_Intake_Raw: the analyst's file is a raw export with two sheets. Sheet 'Intake' (60 rows): VisitID, "
         "VisitRef (e.g. BAR-2025-0012; first 3 letters = site code, case varies), PatientName (\"LAST, FIRST\", "
@@ -676,9 +684,10 @@ def system_prompt(topic: str, student: str) -> str:
 This module's focus: {MODULES[topic]['focus']}
 
 How you work:
-- Write like a busy, supportive manager in a work chat: short, plain, friendly. Under 150 words per reply, except a new request may run to 200. No headings. Short bullet lists are fine.
+- Write like a warm, supportive manager in a work chat: plain, friendly and encouraging, never curt. Under 180 words per reply, except a new request may run to 220. No headings. Short bullet lists are fine.
+- Sound like a person who enjoys mentoring. Open with a genuine, specific reaction to what they did ("Nice, locking the rate with $A$14 is exactly right"), not a verdict word. When something is wrong, say what IS working first, then the issue, in a kind tone ("Close! ..." rather than "Not quite."). When you explain, add a short why, a sentence that connects it to real work ("Finance will reconcile this against the vendor's invoice, so cents matter"). Vary your wording; don't reuse the same stock phrases.
 - Each request gives: why you need it (business context), the specific question(s), who it's for, and when (e.g. "by end of day"). Ask for at most 3 things per request.
-- Every new request (including the first) ends with one prediction question to answer BEFORE they start, e.g. "Before you start: do you expect Barrie's median wait to be above or below its average? Why?" Also call open_request with a short title and that question: the app shows them a prediction box and won't accept their results for the request until they've answered it. Their answer arrives as a message starting with "[Prediction]". Don't say whether it's right; just acknowledge it ("Noted, let's see what the data says") and let them get to work. When their results come in, compare them with the prediction and ask what surprised them, if anything.
+- Every new request (including the first) ends with one prediction question to answer BEFORE they start, e.g. "Before you start: do you expect Barrie's median wait to be above or below its average? Why?" Also call open_request with a short title and that question: the app shows them a prediction box and won't accept their results for the request until they've answered it. Their answer arrives as a message starting with "[Prediction]". Don't say whether it's right; acknowledge it briefly and naturally in your own words (vary it each time; for an "I don't know", encourage a best guess next time), and let them get to work. When their results come in, compare them with the prediction and ask what surprised them, if anything.
 - Stay within this module's Excel skills and a beginner's level. "A little harder" means a new question, an extra split or a judgement call using the same functions, never new techniques (no macros, no functions from a later module). Requests and their data come from Lakeshore's ED and its supplies.
 - If you write your message and then call a tool, don't repeat that message after the tool result. Add only what's new, or nothing.
 - Send data with attach_dataset, naming the dataset. Attach the dataset a request needs with your first request, and again whenever a request switches to another dataset. Later requests may come with a focused extract (one site, one quarter, fewer columns) when that fits. Every attachment goes in the same message as the full request it belongs to: never send a file without saying exactly what to do with it.
@@ -691,7 +700,7 @@ How you work:
 - Occasionally (about every second or third request, and always when a result looks copied rather than built, e.g. correct numbers with formulas they don't seem to understand), once their results are right, run a quick check that they understand their own work: ask them to explain one of their formulas in their own words ("walk me through B5"), or to predict a small change ("if you switched B5 to Orillia, would it go up or down, and roughly to what?"). Check any number they give with query_data. Pick a different cell or change each time.
 - Then ask one realistic follow-up a manager would ask: what explains it, why it matters, what we should do, or who else should see it. 
 - Ask at most two questions per message. When you ask two, number them (1. and 2.) so neither gets lost. Never more than two.
-- If the analyst answers only one of your questions, acknowledge what they answered, then come back to the one they missed ("Thanks, that covers my first question. What about the second: ...?"). Don't move on until both are answered.
+- If the analyst answers only one of your questions, acknowledge what they answered, then come back to the one they missed once, gently ("Thanks, that covers the first one. When you get a sec, what about ...?"). If it's still unanswered after that one reminder, don't ask a third time: give a short hint or the answer with a one-line explanation, and move on. Never sound like you're chasing them.
 - A message that starts with "[Clicked Finish for today]" means they clicked the "Finish for today" button. Don't sign off yet: ask one reflection question (what tripped them up today, and how did they work through it?). After they answer, respond in a sentence or two and sign off warmly. Your end-of-day check-in follows automatically, so never ask them to click the button. If any of your questions were left unanswered, just note you'll pick them up next time.
 - Only if they say goodbye in their own words, without that marker, reply briefly and ask them to click "Finish for today" so you can wrap up with a reflection question and their check-in.
 - Don't do the analysis for them. Show an example formula only if they're stuck after a hint.
@@ -809,7 +818,7 @@ def write_checkin() -> str:
     convo = "\n\n".join(
         f"{'Dana' if m['who'] == 'Dana' else st.session_state.student}: {m['text']}"
         + (f" [attached workbook: {m['upload']}]" if m["upload"] else "")
-        + (" [attached chart screenshot]" if m["img"] else "")
+        + (" [attached screenshot]" if m["img"] else "")
         for m in st.session_state.chat if not m.get("checkin"))
     module = st.session_state.topic.split(" · ")[0]
     prompt = CHECKIN_PROMPT.format(student=st.session_state.student, topic=TOPICS[st.session_state.topic],
@@ -952,7 +961,7 @@ with st.sidebar:
         f"{'Dana Morgan' if m['who'] == 'Dana' else st.session_state.student}: {m['text']}"
         + "".join(f"\n[Attachment: {f['name']}]" for f in m["files"])
         + (f"\n[Attachment: {m['upload']}]" if m["upload"] else "")
-        + ("\n[Attachment: chart screenshot]" if m["img"] else "")
+        + ("\n[Attachment: screenshot]" if m["img"] else "")
         for m in st.session_state.chat)
     st.download_button("Download transcript", transcript,
                        f"transcript_{st.session_state.student}_{st.session_state.student_number}_{datetime.now():%Y%m%d}.txt",
@@ -1055,12 +1064,15 @@ if sent >= MAX_STUDENT_MESSAGES:
     st.warning("You've reached the message limit for this session. Download your transcript, then press Start over.")
     st.stop()
 
-if prediction_pending():
+if st.session_state.get("wrap_stage", 0) == 1:
+    prompt = st.chat_input("Answer Dana's reflection question.")
+    prompt = {"text": prompt, "files": []} if prompt else None
+elif prediction_pending():
     prediction_box()
     prompt = st.chat_input("Ask Dana a question. Save your prediction to unlock attaching your workbook.")
     prompt = {"text": prompt, "files": []} if prompt else None
 else:
-    prompt = st.chat_input("Reply to Dana. Attach your Excel workbook or a chart screenshot.",
+    prompt = st.chat_input("Reply to Dana. Attach your Excel workbook or a screenshot.",
                            accept_file=True, file_type=["xlsx", "png", "jpg", "jpeg"])
     prompt = {"text": prompt.text, "files": list(prompt.files)} if prompt else None
 wrap_up = st.session_state.pop("wrap_up", False)
