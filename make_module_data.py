@@ -6,7 +6,7 @@ Writes to data/:
   Supply_Order.csv          10-line supply order (Weeks 2-3, arithmetic and references)
   ED_Intake_Raw.xlsx        messy intake export + Sites lookup sheet (Week 4, what students get)
   ED_Intake_Clean.csv       the same rows cleaned correctly (Week 4, what Dana checks against)
-  ED_Visits_Dates.csv       visit dates, birth dates and follow-up dates (Week 6)
+  ED_Visits_Dates.csv       birth dates, visit dates and follow-up days (Week 6)
 ED_Visits_2025.csv (Week 5) comes from make_dataset.py and is not changed here.
 """
 from datetime import date, timedelta
@@ -138,16 +138,17 @@ wb.save("data/ED_Intake_Raw.xlsx")
 pd.DataFrame(clean).to_csv("data/ED_Intake_Clean.csv", index=False)
 
 # ------------------------------------------------------------ Week 6: dates
+# Columns A-C match the formulas taught: A = DateOfBirth, B = VisitDate, C = FollowUpDays (=B2+C2).
 ed = pd.read_csv("data/ED_Visits_2025.csv")
-dob, fu = [], []
+dob, fu_days = [], []
 for v, a in zip(ed.VisitDate, ed.Age):
     vd = date.fromisoformat(v)
-    # birthday between a and a+1 years before the visit, so DATEDIF(DOB, visit, "Y") = Age
+    # birthday between a and a+1 years before the visit
     latest = date(vd.year - a, vd.month, min(vd.day, 28))
     dob.append(latest - timedelta(days=int(rng.integers(1, 360))))
-    fu.append(vd + timedelta(days=int(rng.integers(2, 31))) if rng.random() < 0.7 else None)
-dates = pd.DataFrame({"VisitID": ed.VisitID, "VisitDate": ed.VisitDate, "DateOfBirth": [d.isoformat() for d in dob],
-                      "Site": ed.Site, "TriageLevel": ed.TriageLevel,
-                      "FollowUpDate": [d.isoformat() if d else None for d in fu]})
+    fu_days.append(int(rng.integers(2, 31)))
+dates = pd.DataFrame({"DateOfBirth": [d.isoformat() for d in dob], "VisitDate": ed.VisitDate,
+                      "FollowUpDays": fu_days, "VisitID": ed.VisitID, "Site": ed.Site,
+                      "TriageLevel": ed.TriageLevel})
 dates.to_csv("data/ED_Visits_Dates.csv", index=False)
 print("written:", len(day), len(supplies), len(raw), len(dates))

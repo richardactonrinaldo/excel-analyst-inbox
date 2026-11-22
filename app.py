@@ -12,7 +12,9 @@ import json
 import re
 import secrets
 import time
-from datetime import datetime
+import calendar
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import anthropic
@@ -35,16 +37,37 @@ st.set_page_config(page_title="Analyst Inbox", page_icon="📨", layout="wide")
 # ---------------------------------------------------------------- datasets
 # Each dataset has a "check" table Dana computes on, and a file the analyst gets. For most datasets the file
 # is the check table minus Dana's check-only columns; for the messy Week 4 data the file is the raw export.
+def yearfrac_actual(start: date, end: date) -> float:
+    """Excel's YEARFRAC(start, end, 1) (actual/actual), so Dana's ages match INT(YEARFRAC(...,1))."""
+    if start > end:
+        start, end = end, start
+    y1, y2 = start.year, end.year
+    if y1 == y2 or (y2 == y1 + 1 and (start.month, start.day) >= (end.month, end.day)):
+        if y1 == y2:
+            denom = 366 if calendar.isleap(y1) else 365
+        else:
+            has_feb29 = ((calendar.isleap(y1) and start <= date(y1, 2, 29))
+                         or (calendar.isleap(y2) and end >= date(y2, 2, 29)))
+            denom = 366 if has_feb29 else 365
+    else:
+        denom = sum(366 if calendar.isleap(y) else 365 for y in range(y1, y2 + 1)) / (y2 - y1 + 1)
+    return (end - start).days / denom
+
+
 def _dates_check(df: pd.DataFrame) -> pd.DataFrame:
-    v, b, f = (pd.to_datetime(df[c]) for c in ("VisitDate", "DateOfBirth", "FollowUpDate"))
-    age = v.dt.year - b.dt.year - ((v.dt.month < b.dt.month) | ((v.dt.month == b.dt.month) & (v.dt.day < b.dt.day)))
+    """Check-only columns for Week 6, each matching one of the taught formulas (A = DOB, B = VisitDate, C = days)."""
+    today = datetime.now(ZoneInfo("America/Toronto")).date()
+    b, v = pd.to_datetime(df.DateOfBirth).dt.date, pd.to_datetime(df.VisitDate)
     df = df.copy()
-    df["AgeAtVisit"] = age                                   # = DATEDIF(DateOfBirth, VisitDate, "Y")
-    df["DaysToFollowUp"] = (f - v).dt.days                   # = FollowUpDate - VisitDate (blank if no follow-up)
-    df["VisitWeekday"] = v.dt.dayofweek.map(dict(enumerate(WEEKDAYS)))   # = TEXT(VisitDate, "ddd")
-    df["VisitWeekdayNum"] = (v.dt.dayofweek + 1) % 7 + 1     # = WEEKDAY(VisitDate) (1 = Sunday)
-    df["VisitMonthNum"] = v.dt.month                         # = MONTH(VisitDate)
-    df["FollowUpBooked"] = f.notna().map({True: "Yes", False: "No"})
+    df["AgeAtVisit"] = [int(yearfrac_actual(x, y)) for x, y in zip(b, v.dt.date)]   # =INT(YEARFRAC(A2,B2,1))
+    df["CurrentAge"] = [int(yearfrac_actual(today, x)) for x in b]                    # =INT(YEARFRAC(TODAY(),A2,1))
+    df["VisitDayName"] = v.dt.strftime("%A")                                          # =TEXT(B2,"dddd")
+    df["VisitWeekdayNum"] = v.dt.dayofweek + 1                                        # =WEEKDAY(B2,2), Monday = 1
+    df["VisitYearMonthNum"] = v.dt.strftime("%Y-%m")                                  # =TEXT(B2,"yyyy-mm")
+    df["VisitYearMonthShort"] = v.dt.strftime("%Y-%b")                                # =TEXT(B2,"yyyy-mmm")
+    df["VisitYearMonthLong"] = v.dt.strftime("%Y-%B")                                 # =TEXT(B2,"yyyy-mmmm")
+    df["FollowUpDate"] = (v + pd.to_timedelta(df.FollowUpDays, unit="D")).dt.strftime("%Y-%m-%d")   # =B2+C2
+    df["VisitYear"] = v.dt.year                                                       # =YEAR(B2)
     return df
 
 
@@ -57,7 +80,7 @@ def _supply_check(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-@st.cache_data
+@st.cache_data(ttl=3600)   # hourly, so CurrentAge follows TODAY()
 def load_datasets() -> dict:
     ed = pd.read_csv(DATA_DIR / "ED_Visits_2025.csv")
     day = pd.read_csv(DATA_DIR / "ED_Barrie_OneDay.csv")
@@ -77,9 +100,9 @@ def load_datasets() -> dict:
         "ED_Visits_2025": {"check": ed, "file_cols": list(ed.columns), "date_cols": ["VisitDate"],
                            "numeric": ["Age", "TriageLevel", "WaitTimeMin", "LengthOfStayHrs", "CostCAD"]},
         "ED_Visits_Dates": {"check": _dates_check(dates), "file_cols": list(dates.columns),
-                            "date_cols": ["VisitDate", "DateOfBirth", "FollowUpDate"],
-                            "numeric": ["TriageLevel", "AgeAtVisit", "DaysToFollowUp", "VisitWeekdayNum",
-                                        "VisitMonthNum"]},
+                            "date_cols": ["DateOfBirth", "VisitDate"],
+                            "numeric": ["FollowUpDays", "TriageLevel", "AgeAtVisit", "CurrentAge",
+                                        "VisitWeekdayNum", "VisitYear"]},
     }
 
 
@@ -175,7 +198,8 @@ def query_data(metric: str, dataset_name: str | None = None, column: str | None 
         if col not in ds["check"].columns:
             raise ValueError(f"Unknown group_by column {col}")
         present = d[col].dropna().unique()
-        order = MONTHS if col == "Month" else WEEKDAYS if col == "VisitWeekday" else sorted(present, key=str)
+        order = (MONTHS if col == "Month" else list(calendar.day_name) if col == "VisitDayName"
+                 else sorted(present, key=str))
         return [k for k in order if k in set(present)]
 
     def py(k):
@@ -440,11 +464,14 @@ DATASET_DESC = {
         "Shortness of breath, Injury/Fracture, Fever, Headache, Laceration, Mental health), WaitTimeMin, "
         "LengthOfStayHrs, Disposition (Discharged, Admitted, LWBS = left without being seen, Transferred), CostCAD."),
     "ED_Visits_Dates": (
-        "ED_Visits_Dates: 300 rows (the same 2025 visits): VisitID, VisitDate, DateOfBirth, Site, TriageLevel, "
-        "FollowUpDate (blank when no follow-up was booked; about 70% have one). All dates are real Excel dates. "
-        "Check-only columns: AgeAtVisit (= DATEDIF(DateOfBirth, VisitDate, \"Y\")), DaysToFollowUp (= FollowUpDate "
-        "- VisitDate, blank if none), VisitWeekday (Mon..Sun, = TEXT(VisitDate,\"ddd\")), VisitWeekdayNum "
-        "(= WEEKDAY(VisitDate), 1 = Sunday), VisitMonthNum (= MONTH(VisitDate)), FollowUpBooked (Yes/No)."),
+        "ED_Visits_Dates: 300 rows (the same 2025 visits). Columns in this order: A DateOfBirth, B VisitDate (both "
+        "real Excel dates), C FollowUpDays (days until the follow-up appointment, 2-30), D VisitID, E Site, "
+        "F TriageLevel. Check-only columns, each matching a formula the analyst writes in row 2: AgeAtVisit "
+        "(=INT(YEARFRAC(A2,B2,1))), CurrentAge (=INT(YEARFRAC(TODAY(),A2,1)), using today's date), VisitDayName "
+        "(=TEXT(B2,\"dddd\"), e.g. Wednesday), VisitWeekdayNum (=WEEKDAY(B2,2), Monday = 1 ... Sunday = 7), "
+        "VisitYearMonthNum (=TEXT(B2,\"yyyy-mm\"), e.g. 2025-03), VisitYearMonthShort (=TEXT(B2,\"yyyy-mmm\"), "
+        "2025-Mar), VisitYearMonthLong (=TEXT(B2,\"yyyy-mmmm\"), 2025-March), FollowUpDate (=B2+C2, yyyy-mm-dd), "
+        "VisitYear (=YEAR(B2))."),
 }
 
 MODULES = {
@@ -511,21 +538,25 @@ MODULES = {
         "datasets": ["ED_Visits_Dates"],
         "focus": (
             "Random numbers in Excel: RAND, RANDBETWEEN, RANDARRAY; drawing a random sample of visits for a chart "
-            "audit (add a RAND() column and sort by it, or SORTBY/TAKE); why the numbers change on every "
-            "recalculation and how to freeze them (Paste Special > Values). Dates in Excel: dates are serial "
-            "numbers; TODAY, YEAR, MONTH, DAY, WEEKDAY, TEXT(date,\"ddd\") or \"mmm\", date arithmetic (days between "
-            "two dates), DATEDIF for age in years, EDATE, NETWORKDAYS; and summarising by date parts (visits by "
-            "weekday or month, with COUNTIFS on a helper column)."),
+            "audit (add a RAND() column and sort by it); why the numbers change on every recalculation and how to "
+            "freeze them (Paste Special > Values). Dates in Excel, using exactly these formulas (A = DateOfBirth, "
+            "B = VisitDate, C = FollowUpDays): =INT(YEARFRAC(A2,B2,1)) for age at visit, =INT(YEARFRAC(TODAY(),A2,1)) "
+            "for current age, =TEXT(B2,\"dddd\") for the day name, =WEEKDAY(B2,2) for the day number with Monday = 1, "
+            "=TEXT(B2,\"yyyy-mm\"), \"yyyy-mmm\" and \"yyyy-mmmm\" for year-month labels, =B2+C2 for the follow-up "
+            "date, and =YEAR(B2). Requests use these helper columns to answer manager questions (e.g. which weekday "
+            "is busiest, visits by month, age at visit, follow-ups falling on a weekend). Don't introduce other date "
+            "functions (no DATEDIF, EDATE or NETWORKDAYS)."),
         "rules": (
             "- Random results can't be checked against fixed numbers. Check the METHOD instead: the formula, the "
             "range (e.g. RANDBETWEEN(1,300) gives whole numbers 1-300), sample size, no duplicate visits in a sample, "
             "and that they froze the values before reporting. Ask what would happen if they pressed F9.\n"
-            "- Check date work with the check-only columns: AgeAtVisit, DaysToFollowUp, VisitWeekday/VisitWeekdayNum, "
-            "VisitMonthNum, FollowUpBooked. If their ages are 1 too high for some rows, they probably did "
-            "YEAR(VisitDate)-YEAR(DateOfBirth); hint at birthdays later in the year.\n"
-            "- Watch for: days-between showing as a date (needs General/Number format), WEEKDAY numbering (1 = "
-            "Sunday by default), blank FollowUpDate giving a huge negative number, and TODAY() making results "
-            "change from day to day."),
+            "- Check date work with the check-only columns (AgeAtVisit, CurrentAge, VisitDayName, VisitWeekdayNum, "
+            "VisitYearMonthNum/Short/Long, FollowUpDate, VisitYear), e.g. count of VisitDayName = Saturday, mean "
+            "AgeAtVisit, or count where FollowUpDate >= a date.\n"
+            "- Watch for: =B2+C2 showing as a number (needs a date format), WEEKDAY without the 2 (then Sunday = 1), "
+            "YEAR(B2)-YEAR(A2) instead of YEARFRAC (one year too high before the birthday), forgetting INT, "
+            "TEXT results being text (they sort alphabetically, so \"yyyy-mm\" sorts in date order but "
+            "\"yyyy-mmm\" doesn't), and TODAY() making CurrentAge change over time."),
     },
 }
 TOPICS = {k: v["focus"] for k, v in MODULES.items()}   # used by the sidebar and the check-in
@@ -577,7 +608,7 @@ Excel facts to get right (Microsoft 365):
 - TEXTBEFORE and TEXTAFTER return text, so wrap them in VALUE to get a number. TRIM removes leading, trailing and doubled spaces. PROPER capitalises the first letter of each word. COUNTIF criteria are not case-sensitive.
 - XLOOKUP(lookup_value, lookup_array, return_array, [if_not_found]); lock the lookup ranges with $ (or use a Table) before filling down.
 - VAR.S and STDEV.S are for samples; QUARTILE.INC matches Excel's QUARTILE.
-- DATEDIF(start, end, "Y") gives whole years; WEEKDAY(date) returns 1 for Sunday by default.
+- INT(YEARFRAC(start, end, 1)) gives whole years of age. WEEKDAY(date, 2) returns 1 for Monday ... 7 for Sunday (without the 2, Sunday = 1).
 - Table column references (e.g. Barrie[TriageLevel]) shift to the next columns when a formula is dragged across with the fill handle. To lock one, write Barrie[[TriageLevel]:[TriageLevel]].
 - Never guess the analyst's sheet names, table names, column letters or ranges. Use what you can see in their workbook, or ask.
 - Never mention that you are an AI, a simulation or a tool."""

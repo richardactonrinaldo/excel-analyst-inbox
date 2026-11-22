@@ -11,7 +11,7 @@ Module options (students pick one in the sidebar):
 | Weeks 2–3 · Arithmetic and frequency tables | + − × ÷, percentages, number formats, relative/absolute references; frequency, relative, cumulative and grouped frequency tables built without COUNTIF | `Supply_Order` (10 rows), `ED_Barrie_OneDay` (30 rows) |
 | Week 4 · Cleaning messy data | TRIM, PROPER, UPPER, LEFT, VALUE, TEXTBEFORE/TEXTAFTER (blood pressure 120/80), IF, AND, OR, XLOOKUP, COUNTIF, NA/blank handling | `ED_Intake_Raw` (60-row raw export + Sites lookup sheet) |
 | Week 5 · Descriptive statistics and Tables | COUNT, AVERAGE, MEDIAN, MIN, MAX, range, VAR.S, STDEV.S, QUARTILE.INC, IQR, COUNTIFS crosstabs, Excel Tables | `ED_Visits_2025` (300 rows) |
-| Week 6 · Random numbers and dates | RAND, RANDBETWEEN, RANDARRAY, random samples; date arithmetic, DATEDIF, WEEKDAY, TEXT, EDATE, NETWORKDAYS | `ED_Visits_Dates` (300 rows) |
+| Week 6 · Random numbers and dates | RAND, RANDBETWEEN, RANDARRAY, random samples; INT(YEARFRAC(...,1)), TEXT(date,"dddd" / "yyyy-mm" / "yyyy-mmm" / "yyyy-mmmm"), WEEKDAY(date,2), date + days, YEAR, TODAY | `ED_Visits_Dates` (300 rows) |
 
 Dana checks every number against a correct version of each dataset. For the messy Week 4 data she checks against a cleaned answer key (`data/ED_Intake_Clean.csv`), verified by recalculating a full set of cleaning formulas in a spreadsheet.
 
