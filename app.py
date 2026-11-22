@@ -435,7 +435,103 @@ def open_request(title: str, prediction_question: str) -> dict:
                                 "before they can send results for this request."}
 
 TOOLS.append(OPEN_REQUEST_TOOL)
-TOOL_FUNCS = {"query_data": query_data, "attach_dataset": attach_dataset, "open_request": open_request}
+
+# ---------------------------------------------------------------- calculator (exact arithmetic for Dana)
+import ast
+import math
+import operator
+from decimal import ROUND_HALF_UP, Decimal
+
+_BIN = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv,
+        ast.Pow: operator.pow, ast.Mod: operator.mod}
+_UN = {ast.USub: operator.neg, ast.UAdd: operator.pos}
+
+
+def excel_round(x, digits=0):
+    """ROUND the way Excel does it (halves away from zero), not Python's banker's rounding."""
+    q = Decimal(1).scaleb(-int(digits))
+    return float(Decimal(repr(x)).quantize(q, rounding=ROUND_HALF_UP))
+
+
+def _eval(node, row):
+    if isinstance(node, ast.Expression):
+        return _eval(node.body, row)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _BIN:
+        a, b = _eval(node.left, row), _eval(node.right, row)
+        if a is None or b is None:
+            return None
+        return _BIN[type(node.op)](a, b)
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _UN:
+        v = _eval(node.operand, row)
+        return None if v is None else _UN[type(node.op)](v)
+    if isinstance(node, ast.Name):
+        if row is None or node.id not in row:
+            raise ValueError(f"Unknown name {node.id}" + (f". Columns: {', '.join(row)}" if row else ""))
+        v = row[node.id]
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            return None
+        if not isinstance(v, (int, float)):
+            raise ValueError(f"Column {node.id} isn't numeric")
+        return float(v)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and not node.keywords:
+        args = [_eval(a, row) for a in node.args]
+        if any(a is None for a in args):
+            return None
+        fn = {"round": excel_round, "abs": abs, "min": min, "max": max, "int": math.floor, "sqrt": math.sqrt}.get(node.func.id)
+        if fn is None:
+            raise ValueError(f"Function {node.func.id} isn't available. Use round, abs, min, max, int, sqrt.")
+        return fn(*args)
+    raise ValueError("Only numbers, column names, + - * / ** %, parentheses and round/abs/min/max/int/sqrt are allowed.")
+
+
+def calculate(expression: str, dataset_name: str | None = None, filters: list | None = None) -> dict:
+    """Exact arithmetic. Without a dataset: one expression. With a dataset: the expression for every row
+    (column names as variables), plus the total, average, min and max of the results."""
+    tree = ast.parse(expression.replace("^", "**"), mode="eval")
+    if not dataset_name:
+        v = _eval(tree, None)
+        return {"result": round(v, 6)}
+    ds = dataset(dataset_name)
+    df = apply_filters(ds["check"], filters, ds["numeric"])
+    id_col = df.columns[0]
+    vals = []
+    for rec in df.to_dict("records"):
+        v = _eval(tree, rec)
+        vals.append((rec[id_col], None if v is None else round(v, 6)))
+    nums = [v for _, v in vals if v is not None]
+    out = {"rows_matched": len(vals), "blank_results": len(vals) - len(nums)}
+    if nums:
+        out.update({"sum": round(sum(nums), 6), "mean": round(sum(nums) / len(nums), 6),
+                    "min": min(nums), "max": max(nums)})
+    if len(vals) <= 60:
+        out["per_row"] = [{id_col: k, "result": v} for k, v in vals]
+    return out
+
+
+CALC_TOOL = {
+    "name": "calculate",
+    "description": "Exact arithmetic, so you never do maths in your head. Without dataset_name: evaluate one "
+                   "expression, e.g. '(40*12.5 + 30*9.8) * 1.13' or 'round(3848.44*0.05, 2)'. With dataset_name: "
+                   "evaluate the expression on every row, using column names as variables (e.g. "
+                   "'Quantity * UnitCostCAD * 0.95'), and get the per-row results (up to 60 rows) plus their sum, "
+                   "mean, min and max. Filters work as in query_data. round() rounds like Excel's ROUND.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "expression": {"type": "string"},
+            "dataset_name": {"type": "string", "enum": list(DATASETS)},
+            "filters": FILTER_SCHEMA,
+        },
+        "required": ["expression"],
+    },
+}
+
+TOOLS.append(CALC_TOOL)
+
+TOOL_FUNCS = {"query_data": query_data, "attach_dataset": attach_dataset, "open_request": open_request,
+              "calculate": calculate}
 
 # ---------------------------------------------------------------- persona
 DATASET_DESC = {
@@ -495,7 +591,9 @@ MODULES = {
             "for the $ and ask what would break without it if they dragged the formula down.\n"
             "- Watch the classic mistakes: relative frequencies that don't sum to 1 (or 100%), the last cumulative "
             "frequency not equal to the total, overlapping class limits (0-30, 30-60), percentages stored as 13 "
-            "instead of 0.13 or 13%, and rounding with formatting vs ROUND."),
+            "instead of 0.13 or 13%, and rounding with formatting vs ROUND.\n"
+            "- For any arithmetic beyond the check-only columns (a discount, budget vs actual, a percent of the "
+            "total), check with calculate, e.g. calculate('Quantity * UnitCostCAD * 0.95', dataset_name='Supply_Order')."),
     },
     "Week 4 · Cleaning messy data": {
         "datasets": ["ED_Intake_Raw"],
@@ -587,7 +685,7 @@ How you work:
 - One thing at a time. Don't stack a new request on top of an unfinished one. When you ask a follow-up question, wait for the answer, respond to it, and only then send the next request.
 - Now and then leave one detail a little vague so the analyst has to ask a clarifying question. Answer clarifying questions the way a real manager would.
 - Numbers count only when they come in the analyst's uploaded Excel workbook. If they type results without attaching the workbook, ask for the workbook before you confirm anything; you can still answer questions and clarify in the meantime. In the workbook, each result should be a formula (shown as "B4: =AVERAGE(...) -> 80.8"). A result typed in as a plain number ("B4: 80.8") doesn't count: ask them to replace it with the formula that produces it. Module-specific exceptions are listed below.
-- Before you comment on ANY number the analyst reports, check it with the query_data tool (on the right dataset). Never guess. If they attached their workbook, review their formulas and results the same way and refer to specific cells (e.g. "your formula in B4"). Only call a cell right or wrong if you can actually see it. Remember an extract you sent has fewer rows than the full dataset, so check against the same filters.
+- Before you comment on ANY number the analyst reports, check it with the query_data tool (on the right dataset), or with calculate for any arithmetic query_data can't do (a discount, a difference, a percent of a total, a rate). Never do arithmetic in your head and never guess. If they attached their workbook, review their formulas and results the same way and refer to specific cells (e.g. "your formula in B4"). Only call a cell right or wrong if you can actually see it. Remember an extract you sent has fewer rows than the full dataset, so check against the same filters.
 - If a number is right, say so specifically. If it is off, say which figure doesn't match what you're seeing and give a hint (which function, range, filter or step to recheck). Don't reveal the correct value until they've missed it twice; then show it and explain briefly.
 - The same goes for interpretation. If their takeaway is wrong, point them back at their own numbers with a guiding question ("compare B10 and B11: which group waits longer?") before you explain the right reading. Explain it only after a second miss.
 - Occasionally (about every second or third request, and always when a result looks copied rather than built, e.g. correct numbers with formulas they don't seem to understand), once their results are right, run a quick check that they understand their own work: ask them to explain one of their formulas in their own words ("walk me through B5"), or to predict a small change ("if you switched B5 to Orillia, would it go up or down, and roughly to what?"). Check any number they give with query_data. Pick a different cell or change each time.
